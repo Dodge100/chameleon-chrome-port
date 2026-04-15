@@ -1,6 +1,6 @@
 {
   "extDescription": {
-    "message": "Spoof your browser profile. Includes a few privacy enhancing options."
+    "message": "Unofficial port of Chameleon for Chromium browsers. Spoof your browser profile and use privacy-enhancing options."
   },
   "notifications-profileChange": {
     "message": "Profile changed:"

@@ -14,6 +14,7 @@ const config = {
     'popup/popup': './popup/popup.ts',
     'options/options': './options/options.ts',
     inject: './lib/inject.ts',
+    'inject-bridge': './lib/inject-bridge.ts',
   },
   output: {
     path: __dirname + '/dist',
@@ -79,7 +80,17 @@ const config = {
       { from: 'icons', to: 'icons', ignore: ['icon.xcf'] },
       { from: 'popup/popup.html', to: 'popup/popup.html', transform: transformHtml },
       { from: 'options/options.html', to: 'options/options.html', transform: transformHtml },
-      { from: '_locales', to: '_locales' },
+      {
+        from: '_locales',
+        to: '_locales',
+        transform: (content, filePath) => {
+          if (!filePath.endsWith('messages.json')) {
+            return content;
+          }
+
+          return transformLocaleMessages(content);
+        },
+      },
       {
         from: 'manifest.json',
         to: 'manifest.json',
@@ -87,7 +98,13 @@ const config = {
           const jsonContent = JSON.parse(content);
 
           if (config.mode === 'development') {
-            jsonContent['content_security_policy'] = "script-src 'self' 'unsafe-eval'; object-src 'self'";
+            if (jsonContent.manifest_version === 3) {
+              jsonContent['content_security_policy'] = {
+                extension_pages: "script-src 'self' 'unsafe-eval'; object-src 'self'",
+              };
+            } else {
+              jsonContent['content_security_policy'] = "script-src 'self' 'unsafe-eval'; object-src 'self'";
+            }
           }
 
           return JSON.stringify(jsonContent, null, 2);
@@ -119,6 +136,23 @@ function transformHtml(content) {
   return ejs.render(content.toString(), {
     ...process.env,
   });
+}
+
+function transformLocaleMessages(content) {
+  const parsed = JSON.parse(content.toString());
+  const transformed = {};
+
+  for (const key of Object.keys(parsed)) {
+    const normalizedKey = key.replace(/[^a-zA-Z0-9_]/g, '_');
+
+    if (normalizedKey in transformed) {
+      throw new Error(`Locale key collision while normalizing '${key}' -> '${normalizedKey}'`);
+    }
+
+    transformed[normalizedKey] = parsed[key];
+  }
+
+  return JSON.stringify(transformed, null, 2);
 }
 
 module.exports = config;

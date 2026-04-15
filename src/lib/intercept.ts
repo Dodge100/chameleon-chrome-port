@@ -33,7 +33,6 @@ interface WhitelistResult {
 }
 
 class Interceptor {
-  private LINK: any;
   private profiles: prof.Generator;
   private profileCache: any;
   private settings: any;
@@ -47,7 +46,6 @@ class Interceptor {
       HTTPS: RegExp(/^https:\/\//),
     };
 
-    this.LINK = document.createElement('a');
     this.profiles = new prof.Generator();
     this.settings = settings;
     this.tempStore = tempStore;
@@ -111,8 +109,8 @@ class Interceptor {
     }
 
     if (url) {
-      this.LINK.href = url;
-      let rule = util.findWhitelistRule(this.settings.whitelist.rules, this.LINK.host, url);
+      let requestUrl = new URL(url);
+      let rule = util.findWhitelistRule(this.settings.whitelist.rules, requestUrl.host, url);
 
       if (rule) {
         return {
@@ -143,8 +141,8 @@ class Interceptor {
       }
     }
 
-    this.LINK.href = details.documentUrl || details.url;
-    if (util.isInternalIP(this.LINK.hostname)) return;
+    let targetUrl = new URL(details.documentUrl || details.url);
+    if (util.isInternalIP(targetUrl.hostname)) return;
 
     let wl: WhitelistResult = this.checkWhitelist(details);
 

@@ -3,7 +3,6 @@ const CIDR = require('cidr-js');
 
 const cidr = new CIDR();
 const REGEX_HTTP = new RegExp('^https?:', 'i');
-const LINK = document.createElement('a');
 
 let deepMerge = (target: object, source: object) => {
   Object.entries(source).forEach(([key, value]) => {
@@ -20,10 +19,10 @@ let deepMerge = (target: object, source: object) => {
 let determineRequestType = (source: string, destination: string): string => {
   if (!source) return 'none';
 
-  LINK.href = source;
-  let s = psl.parse(LINK.hostname);
-  LINK.href = destination;
-  let d = psl.parse(LINK.hostname);
+  let sUrl = new URL(source);
+  let dUrl = new URL(destination);
+  let s = psl.parse(sUrl.hostname);
+  let d = psl.parse(dUrl.hostname);
 
   if (s.domain != d.domain) {
     return 'cross-site';

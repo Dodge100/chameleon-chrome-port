@@ -1,3 +1,4 @@
+import '../lib/compat';
 import Vue from 'vue';
 import VueFeather from 'vue-feather';
 import VueI18n from 'vue-i18n';

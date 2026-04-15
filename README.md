@@ -6,6 +6,8 @@
 
 Chameleon is a WebExtension port of the popular Firefox addon [Random Agent Spoofer](https://github.com/dillbyrne/random-agent-spoofer).
 
+> This repository is an **unofficial port of Chameleon for Chromium browsers**.
+
 The UI is near identical and contains most of the features found in the original extension.
 
 ## Features

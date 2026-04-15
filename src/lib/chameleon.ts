@@ -1,9 +1,11 @@
 import * as lang from '../lib/language';
 import * as prof from '../lib/profiles';
 import { getTimezones } from '../lib/tz';
+import { getBrowserInfo } from './compat';
 
 import util from './util';
 import webext from './webext';
+import whitelisted from './whitelisted';
 import { Interceptor } from './intercept';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -15,6 +17,18 @@ enum IntervalOption {
 enum SpoofIPOption {
   Random = 0,
   Custom = 1,
+}
+
+enum RefererXOriginOption {
+  AlwaysSend = 0,
+  MatchBaseDomain = 1,
+  MatchHost = 2,
+}
+
+enum RefererTrimOption {
+  SendFullURI = 0,
+  SchemeWithPath = 1,
+  SchemeNoPath = 2,
 }
 
 interface TemporarySettings {
@@ -42,6 +56,11 @@ export class Chameleon {
   public timeout: any;
   public updateContextMenu: Function;
   public version: string;
+  private hasLegacyWebRequestListeners: boolean;
+  private dnrListenersRegistered: boolean;
+  private dnrSyncTimeout: any;
+  private dnrSyncInProgress: boolean;
+  private dnrSyncQueued: boolean;
 
   constructor(initSettings: any) {
     this.settings = initSettings;
@@ -65,6 +84,11 @@ export class Chameleon {
     this.intervalTimeout = null;
     this.profileCache = {};
     this.version = browser.runtime.getManifest().version;
+    this.hasLegacyWebRequestListeners = false;
+    this.dnrListenersRegistered = false;
+    this.dnrSyncTimeout = null;
+    this.dnrSyncInProgress = false;
+    this.dnrSyncQueued = false;
     this.REGEX_UUID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
     // Firefox 115 is the last version of Firefox for Windows 7, 8, 8.1
@@ -87,10 +111,8 @@ export class Chameleon {
       }
 
       // check if site already in whitelist
-      let l = document.createElement('a');
-      l.href = info.pageUrl;
-
-      let rule = util.findWhitelistRule(this.settings.whitelist.rules, l.host, info.pageUrl);
+      let pageUrl = new URL(info.pageUrl);
+      let rule = util.findWhitelistRule(this.settings.whitelist.rules, pageUrl.host, info.pageUrl);
 
       if (rule) {
         browser.contextMenus.create({
@@ -98,10 +120,9 @@ export class Chameleon {
           title: browser.i18n.getMessage('text-removeFromRule', rule.name),
           contexts: ['page'],
           onclick: details => {
-            let l = document.createElement('a');
-            l.href = details.pageUrl;
+            let pageUrl = new URL(details.pageUrl);
 
-            if (['http:', 'https:'].includes(l.protocol)) {
+            if (['http:', 'https:'].includes(pageUrl.protocol)) {
               const ruleIndex = this.settings.whitelist.rules.findIndex(r => r.id === rule.id);
 
               if (ruleIndex > -1) {
@@ -119,12 +140,11 @@ export class Chameleon {
           title: browser.i18n.getMessage('text-createNewRule'),
           contexts: ['page'],
           onclick: function(details) {
-            var l = document.createElement('a');
-            l.href = details.pageUrl;
+            let pageUrl = new URL(details.pageUrl);
 
-            if (['http:', 'https:'].includes(l.protocol)) {
+            if (['http:', 'https:'].includes(pageUrl.protocol)) {
               browser.tabs.create({
-                url: browser.runtime.getURL(`/options/options.html#whitelist?site=${l.host}`),
+                url: browser.runtime.getURL(`/options/options.html#whitelist?site=${pageUrl.host}`),
               });
             }
           },
@@ -136,12 +156,11 @@ export class Chameleon {
             title: browser.i18n.getMessage('text-addToRule', this.settings.whitelist.rules[i].name),
             contexts: ['page'],
             onclick: details => {
-              let l = document.createElement('a');
-              l.href = details.pageUrl;
+              let pageUrl = new URL(details.pageUrl);
 
-              if (['http:', 'https:'].includes(l.protocol)) {
+              if (['http:', 'https:'].includes(pageUrl.protocol)) {
                 this.settings.whitelist.rules[i].sites.push({
-                  domain: l.host,
+                  domain: pageUrl.host,
                 });
                 this.saveSettings(this.settings);
                 this.buildInjectionScript();
@@ -156,55 +175,54 @@ export class Chameleon {
   }
 
   public async buildInjectionScript() {
-    if (this.injectionScript) {
-      await this.injectionScript.unregister();
-      this.injectionScript = null;
-    }
-
-    this.injectionScript = await browser.contentScripts.register({
-      allFrames: true,
-      matchAboutBlank: true,
-      matches: ['http://*/*', 'https://*/*'],
-      js: [
-        {
-          code: `
-            let settings = ${JSON.stringify(this.settings)};
-            let tempStore = ${JSON.stringify(this.tempStore)};
-            let profileCache = ${JSON.stringify(this.profileCache)};
-            let seed = ${Math.random() * 0.00000001};
-            let randObjName = '${String.fromCharCode(65 + Math.floor(Math.random() * 26)) +
-              Math.random()
-                .toString(36)
-                .substring(Math.floor(Math.random() * 5) + 5)}';
-          `,
-        },
-        { file: 'inject.js' },
-      ],
-      runAt: 'document_start',
+    await webext.setInjectionData({
+      profileCache: this.profileCache,
+      randObjName:
+        String.fromCharCode(65 + Math.floor(Math.random() * 26)) +
+        Math.random()
+          .toString(36)
+          .substring(Math.floor(Math.random() * 5) + 5),
+      seed: Math.random() * 0.00000001,
+      settings: this.settings,
+      tempStore: this.tempStore,
     });
+
+    this.setupHeaderListeners();
   }
 
   public async changeBrowserSettings(): Promise<void> {
-    await browser.privacy.websites.cookieConfig.set({
-      value: {
-        behavior: this.settings.options.cookiePolicy,
-        nonPersistentCookies: this.settings.options.cookieNotPersistent,
-      },
-    });
+    if (!browser.privacy) {
+      return;
+    }
+
+    if (browser.privacy.websites.cookieConfig) {
+      await browser.privacy.websites.cookieConfig.set({
+        value: {
+          behavior: this.settings.options.cookiePolicy,
+          nonPersistentCookies: this.settings.options.cookieNotPersistent,
+        },
+      });
+    }
 
     ['firstPartyIsolate', 'resistFingerprinting', 'trackingProtectionMode'].forEach(async key => {
-      await browser.privacy.websites[key].set({
-        value: this.settings.options[key],
+      if (browser.privacy.websites[key]) {
+        await browser.privacy.websites[key].set({
+          value: this.settings.options[key],
+        });
+      }
+    });
+
+    if (browser.privacy.network.peerConnectionEnabled) {
+      await browser.privacy.network.peerConnectionEnabled.set({
+        value: !this.settings.options.disableWebRTC,
       });
-    });
+    }
 
-    await browser.privacy.network.peerConnectionEnabled.set({
-      value: !this.settings.options.disableWebRTC,
-    });
-
-    await browser.privacy.network.webRTCIPHandlingPolicy.set({
-      value: this.settings.options.webRTCPolicy,
-    });
+    if (browser.privacy.network.webRTCIPHandlingPolicy) {
+      await browser.privacy.network.webRTCIPHandlingPolicy.set({
+        value: this.settings.options.webRTCPolicy,
+      });
+    }
   }
 
   public cleanSettings(): void {
@@ -268,28 +286,40 @@ export class Chameleon {
 
     if (!!browser.privacy) {
       // get current modified preferences
-      let cookieSettings = await browser.privacy.websites.cookieConfig.get({});
-      this.settings.options.cookieNotPersistent = cookieSettings.value.nonPersistentCookies;
-      this.settings.options.cookiePolicy = cookieSettings.value.behavior;
+      if (browser.privacy.websites.cookieConfig) {
+        let cookieSettings = await browser.privacy.websites.cookieConfig.get({});
+        this.settings.options.cookieNotPersistent = cookieSettings.value.nonPersistentCookies;
+        this.settings.options.cookiePolicy = cookieSettings.value.behavior;
+      }
 
-      let firstPartyIsolate = await browser.privacy.websites.firstPartyIsolate.get({});
-      this.settings.options.firstPartyIsolate = firstPartyIsolate.value;
+      if (browser.privacy.websites.firstPartyIsolate) {
+        let firstPartyIsolate = await browser.privacy.websites.firstPartyIsolate.get({});
+        this.settings.options.firstPartyIsolate = firstPartyIsolate.value;
+      }
 
-      let resistFingerprinting = await browser.privacy.websites.resistFingerprinting.get({});
-      this.settings.options.resistFingerprinting = resistFingerprinting.value;
+      if (browser.privacy.websites.resistFingerprinting) {
+        let resistFingerprinting = await browser.privacy.websites.resistFingerprinting.get({});
+        this.settings.options.resistFingerprinting = resistFingerprinting.value;
+      }
 
-      let trackingProtectionMode = await browser.privacy.websites.trackingProtectionMode.get({});
-      this.settings.options.trackingProtectionMode = trackingProtectionMode.value;
+      if (browser.privacy.websites.trackingProtectionMode) {
+        let trackingProtectionMode = await browser.privacy.websites.trackingProtectionMode.get({});
+        this.settings.options.trackingProtectionMode = trackingProtectionMode.value;
+      }
 
-      let peerConnectionEnabled = await browser.privacy.network.peerConnectionEnabled.get({});
-      this.settings.options.disableWebRTC = !peerConnectionEnabled.value;
+      if (browser.privacy.network.peerConnectionEnabled) {
+        let peerConnectionEnabled = await browser.privacy.network.peerConnectionEnabled.get({});
+        this.settings.options.disableWebRTC = !peerConnectionEnabled.value;
+      }
 
-      let webRTCIPHandlingPolicy = await browser.privacy.network.webRTCIPHandlingPolicy.get({});
-      this.settings.options.webRTCPolicy = webRTCIPHandlingPolicy.value;
+      if (browser.privacy.network.webRTCIPHandlingPolicy) {
+        let webRTCIPHandlingPolicy = await browser.privacy.network.webRTCIPHandlingPolicy.get({});
+        this.settings.options.webRTCPolicy = webRTCIPHandlingPolicy.value;
+      }
     }
 
     this.platform = await browser.runtime.getPlatformInfo();
-    this.browserInfo = await browser.runtime.getBrowserInfo();
+    this.browserInfo = await getBrowserInfo();
 
     this.tempStore.version = this.browserInfo.version;
 
@@ -746,7 +776,599 @@ export class Chameleon {
     }
   }
 
-  public setupHeaderListeners(): void {
+  private cleanDNRCondition(condition: any): any {
+    let cleaned: any = {};
+
+    for (let [k, v] of Object.entries(condition)) {
+      if (Array.isArray(v)) {
+        if (v.length > 0) {
+          cleaned[k] = Array.from(new Set(v));
+        }
+      } else if (v !== undefined && v !== null && v !== '') {
+        cleaned[k] = v;
+      }
+    }
+
+    return cleaned;
+  }
+
+  private normalizeDomain(input: string): string[] {
+    try {
+      let parsed = new URL(/^[a-z]+:\/\//i.test(input) ? input : `https://${input}`);
+      let hostname = parsed.hostname.toLowerCase();
+
+      if (!hostname || hostname.includes('*')) {
+        return [];
+      }
+
+      let domains = new Set<string>([hostname]);
+
+      if (hostname.startsWith('www.')) {
+        domains.add(hostname.replace(/^www\./, ''));
+      }
+
+      return Array.from(domains);
+    } catch (e) {
+      return [];
+    }
+  }
+
+  private getExcludedDomains(): string[] {
+    let excluded = new Set<string>();
+
+    for (let url of whitelisted) {
+      this.normalizeDomain(url).forEach(d => excluded.add(d));
+    }
+
+    excluded.add('localhost');
+    excluded.add('127.0.0.1');
+
+    return Array.from(excluded);
+  }
+
+  private getGlobalProfileForHeaders(): any {
+    if (this.settings.profile.selected === 'none' || this.settings.excluded.includes(this.settings.profile.selected) || this.tempStore.profile === 'none') {
+      return null;
+    }
+
+    let profileId: string = this.settings.profile.selected.includes('-') ? this.settings.profile.selected : this.tempStore.profile;
+
+    if (!profileId) {
+      return null;
+    }
+
+    if (!(profileId in this.profileCache)) {
+      this.profileCache[profileId] = new prof.Generator().getProfile(profileId);
+    }
+
+    return this.profileCache[profileId] || null;
+  }
+
+  private getWhitelistProfileForHeaders(rule: any): any {
+    let profileId = rule.profile === 'default' ? this.settings.whitelist.defaultProfile : rule.profile;
+
+    if (!profileId || profileId === 'none') {
+      return null;
+    }
+
+    if (!(profileId in this.profileCache)) {
+      this.profileCache[profileId] = new prof.Generator().getProfile(profileId);
+    }
+
+    return this.profileCache[profileId] || null;
+  }
+
+  private getSpoofedAcceptLanguage(langCode: string): string | null {
+    if (!langCode || langCode === 'default') {
+      return null;
+    }
+
+    if (langCode === 'ip') {
+      if (this.tempStore.ipInfo.lang) {
+        return lang.getLanguage(this.tempStore.ipInfo.lang).value;
+      }
+
+      return null;
+    }
+
+    let language = lang.getLanguage(langCode);
+    return language ? language.value : null;
+  }
+
+  private isHttpUrl(url: string): boolean {
+    return /^https?:\/\//i.test(url);
+  }
+
+  private isBypassUrl(url: string): boolean {
+    return whitelisted.some(prefix => url.startsWith(prefix));
+  }
+
+  private getRefererValue(tabUrl: string, trimming: number): string {
+    try {
+      let parsed = new URL(tabUrl);
+
+      if (trimming === RefererTrimOption.SchemeWithPath) {
+        return parsed.origin + parsed.pathname;
+      }
+
+      if (trimming === RefererTrimOption.SchemeNoPath) {
+        return parsed.origin;
+      }
+
+      return tabUrl;
+    } catch (e) {
+      return tabUrl;
+    }
+  }
+
+  private buildTabContext(tab: any, globalProfile: any, globalLangHeader: string | null, globalSpoofIP: string): any {
+    if (!tab || typeof tab.id !== 'number' || !tab.url || !this.isHttpUrl(tab.url) || this.isBypassUrl(tab.url)) {
+      return null;
+    }
+
+    let parsedTabUrl: URL;
+
+    try {
+      parsedTabUrl = new URL(tab.url);
+    } catch (e) {
+      return null;
+    }
+
+    if (util.isInternalIP(parsedTabUrl.hostname)) {
+      return null;
+    }
+
+    let whitelistRule = util.findWhitelistRule(this.settings.whitelist.rules, parsedTabUrl.host, tab.url);
+    let isWhitelisted = !!whitelistRule;
+
+    let profile = isWhitelisted ? this.getWhitelistProfileForHeaders(whitelistRule) : globalProfile;
+
+    let acceptLanguage = globalLangHeader;
+    if (isWhitelisted && whitelistRule.lang !== 'default') {
+      acceptLanguage = this.getSpoofedAcceptLanguage(whitelistRule.lang);
+    }
+
+    let spoofIP = isWhitelisted ? whitelistRule.spoofIP || '' : globalSpoofIP;
+
+    let websocketMode = isWhitelisted ? (whitelistRule.options.ws ? 'block_all' : 'allow_all') : this.settings.options.webSockets;
+
+    let refererMode = {
+      remove: false,
+      removeThirdParty: false,
+      setValue: null,
+      setScope: null,
+      requestDomains: [],
+    };
+
+    if (isWhitelisted && whitelistRule.options.ref) {
+      refererMode.remove = true;
+    } else if (this.settings.headers.referer.disabled) {
+      refererMode.remove = true;
+    } else {
+      let xorigin = this.settings.headers.referer.xorigin;
+      let trimming = this.settings.headers.referer.trimming;
+      let refererValue = this.getRefererValue(tab.url, trimming);
+
+      if (xorigin === RefererXOriginOption.AlwaysSend) {
+        if (trimming !== RefererTrimOption.SendFullURI) {
+          refererMode.setValue = refererValue;
+          refererMode.setScope = 'all';
+        }
+      } else if (xorigin === RefererXOriginOption.MatchBaseDomain) {
+        if (trimming === RefererTrimOption.SendFullURI) {
+          refererMode.removeThirdParty = true;
+        } else {
+          refererMode.remove = true;
+          refererMode.setValue = refererValue;
+          refererMode.setScope = 'firstParty';
+        }
+      } else {
+        refererMode.remove = true;
+        refererMode.setValue = refererValue;
+        refererMode.setScope = 'host';
+        refererMode.requestDomains = [parsedTabUrl.hostname];
+      }
+    }
+
+    return {
+      tabId: tab.id,
+      hostname: parsedTabUrl.hostname,
+      profile,
+      acceptLanguage,
+      spoofIP,
+      blockEtag: !isWhitelisted && this.settings.headers.blockEtag,
+      websocketMode,
+      refererMode,
+    };
+  }
+
+  private queueDeclarativeSync(delay = 150): void {
+    if (this.dnrSyncTimeout) {
+      clearTimeout(this.dnrSyncTimeout);
+    }
+
+    this.dnrSyncTimeout = setTimeout(() => {
+      this.syncDeclarativeRules().catch(e => {
+        console.error('Unable to update declarativeNetRequest rules', e);
+      });
+    }, delay);
+  }
+
+  private registerDeclarativeListeners(): void {
+    if (this.dnrListenersRegistered) {
+      return;
+    }
+
+    let scheduleSync = () => this.queueDeclarativeSync();
+    let canListen = (eventObj: any): boolean => !!eventObj && typeof eventObj.addListener === 'function';
+
+    if (canListen(browser.tabs?.onUpdated)) {
+      browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
+        if (changeInfo.url || changeInfo.status === 'complete') {
+          scheduleSync();
+        }
+      });
+    }
+
+    if (canListen(browser.tabs?.onRemoved)) {
+      browser.tabs.onRemoved.addListener(() => {
+        scheduleSync();
+      });
+    }
+
+    if (canListen(browser.tabs?.onCreated)) {
+      browser.tabs.onCreated.addListener(() => {
+        scheduleSync();
+      });
+    }
+
+    if (canListen(browser.tabs?.onActivated)) {
+      browser.tabs.onActivated.addListener(() => {
+        scheduleSync();
+      });
+    }
+
+    if (canListen(browser.tabs?.onReplaced)) {
+      browser.tabs.onReplaced.addListener(() => {
+        scheduleSync();
+      });
+    }
+
+    this.dnrListenersRegistered = true;
+  }
+
+  private async syncDeclarativeRules(): Promise<void> {
+    let dnr = browser.declarativeNetRequest;
+
+    if (!dnr) {
+      return;
+    }
+
+    if (this.dnrSyncInProgress) {
+      this.dnrSyncQueued = true;
+      return;
+    }
+
+    this.dnrSyncInProgress = true;
+
+    try {
+      let usesSessionRules = typeof dnr.updateSessionRules === 'function' && typeof dnr.getSessionRules === 'function';
+      let getRules = usesSessionRules ? dnr.getSessionRules.bind(dnr) : dnr.getDynamicRules.bind(dnr);
+      let updateRules = usesSessionRules ? dnr.updateSessionRules.bind(dnr) : dnr.updateDynamicRules.bind(dnr);
+
+      let existingRules = await getRules();
+
+      if (!this.settings.config.enabled) {
+        if (existingRules.length > 0) {
+          await updateRules({
+            removeRuleIds: existingRules.map(r => r.id),
+            addRules: [],
+          });
+        }
+
+        return;
+      }
+
+      let allRequestTypes = ['main_frame', 'sub_frame', 'stylesheet', 'script', 'image', 'font', 'object', 'xmlhttprequest', 'ping', 'csp_report', 'media', 'websocket', 'other'];
+      let frameRequestTypes = ['main_frame', 'sub_frame'];
+      let pollingRequestTypes = ['main_frame', 'sub_frame', 'script', 'xmlhttprequest', 'other'];
+
+      let excludedDomains = this.getExcludedDomains();
+      let globalProfile = this.getGlobalProfileForHeaders();
+      let globalLangHeader = this.settings.headers.spoofAcceptLang.enabled ? this.getSpoofedAcceptLanguage(this.settings.headers.spoofAcceptLang.value) : null;
+      let globalSpoofIP = this.settings.headers.spoofIP.enabled ? this.tempStore.spoofIP : '';
+
+      let rules = [];
+      let nextRuleId = 1;
+
+      let addRule = (rule: any) => {
+        rules.push({
+          id: nextRuleId++,
+          ...rule,
+        });
+      };
+
+      addRule({
+        priority: 10,
+        action: {
+          type: 'modifyHeaders',
+          requestHeaders: [
+            this.settings.headers.enableDNT
+              ? {
+                  header: 'dnt',
+                  operation: 'set',
+                  value: '1',
+                }
+              : {
+                  header: 'dnt',
+                  operation: 'remove',
+                },
+          ],
+        },
+        condition: this.cleanDNRCondition({
+          resourceTypes: allRequestTypes,
+          excludedRequestDomains: excludedDomains,
+        }),
+      });
+
+      let tabs = [];
+      try {
+        tabs = await browser.tabs.query({});
+      } catch (e) {
+        tabs = [];
+      }
+
+      let tabContexts = tabs.map(tab => this.buildTabContext(tab, globalProfile, globalLangHeader, globalSpoofIP)).filter(Boolean);
+
+      tabContexts.forEach((ctx, idx) => {
+        let basePriority = 1000 + idx * 20;
+        let tabConditionBase = {
+          tabIds: [ctx.tabId],
+          excludedRequestDomains: excludedDomains,
+        };
+
+        let requestHeaders = [];
+
+        if (ctx.profile?.navigator?.userAgent) {
+          requestHeaders.push({
+            header: 'user-agent',
+            operation: 'set',
+            value: ctx.profile.navigator.userAgent,
+          });
+        }
+
+        if (ctx.acceptLanguage) {
+          requestHeaders.push({
+            header: 'accept-language',
+            operation: 'set',
+            value: ctx.acceptLanguage,
+          });
+        }
+
+        if (ctx.spoofIP) {
+          requestHeaders.push(
+            {
+              header: 'via',
+              operation: 'set',
+              value: `1.1 ${ctx.spoofIP}`,
+            },
+            {
+              header: 'x-forwarded-for',
+              operation: 'set',
+              value: ctx.spoofIP,
+            }
+          );
+        }
+
+        if (requestHeaders.length > 0) {
+          addRule({
+            priority: basePriority + 1,
+            action: {
+              type: 'modifyHeaders',
+              requestHeaders,
+            },
+            condition: this.cleanDNRCondition({
+              ...tabConditionBase,
+              resourceTypes: allRequestTypes,
+            }),
+          });
+        }
+
+        if (ctx.profile) {
+          addRule({
+            priority: basePriority + 2,
+            action: {
+              type: 'modifyHeaders',
+              requestHeaders: [
+                {
+                  header: 'accept',
+                  operation: 'set',
+                  value: ctx.profile.accept.header,
+                },
+              ],
+            },
+            condition: this.cleanDNRCondition({
+              ...tabConditionBase,
+              resourceTypes: frameRequestTypes,
+            }),
+          });
+
+          addRule({
+            priority: basePriority + 3,
+            action: {
+              type: 'modifyHeaders',
+              requestHeaders: [
+                {
+                  header: 'accept-encoding',
+                  operation: 'set',
+                  value: ctx.profile.accept.encodingHTTP,
+                },
+              ],
+            },
+            condition: this.cleanDNRCondition({
+              ...tabConditionBase,
+              resourceTypes: frameRequestTypes,
+              regexFilter: '^http://',
+            }),
+          });
+
+          addRule({
+            priority: basePriority + 4,
+            action: {
+              type: 'modifyHeaders',
+              requestHeaders: [
+                {
+                  header: 'accept-encoding',
+                  operation: 'set',
+                  value: ctx.profile.accept.encodingHTTPS,
+                },
+              ],
+            },
+            condition: this.cleanDNRCondition({
+              ...tabConditionBase,
+              resourceTypes: frameRequestTypes,
+              regexFilter: '^https://',
+            }),
+          });
+        }
+
+        if (ctx.refererMode.remove) {
+          addRule({
+            priority: basePriority + 5,
+            action: {
+              type: 'modifyHeaders',
+              requestHeaders: [
+                {
+                  header: 'referer',
+                  operation: 'remove',
+                },
+              ],
+            },
+            condition: this.cleanDNRCondition({
+              ...tabConditionBase,
+              resourceTypes: allRequestTypes,
+            }),
+          });
+        } else if (ctx.refererMode.removeThirdParty) {
+          addRule({
+            priority: basePriority + 5,
+            action: {
+              type: 'modifyHeaders',
+              requestHeaders: [
+                {
+                  header: 'referer',
+                  operation: 'remove',
+                },
+              ],
+            },
+            condition: this.cleanDNRCondition({
+              ...tabConditionBase,
+              resourceTypes: allRequestTypes,
+              domainType: 'thirdParty',
+            }),
+          });
+        }
+
+        if (ctx.refererMode.setValue) {
+          let refererCondition: any = {
+            ...tabConditionBase,
+            resourceTypes: allRequestTypes,
+          };
+
+          if (ctx.refererMode.setScope === 'host' && ctx.refererMode.requestDomains.length > 0) {
+            refererCondition.requestDomains = ctx.refererMode.requestDomains;
+          } else if (ctx.refererMode.setScope === 'firstParty') {
+            refererCondition.domainType = 'firstParty';
+          }
+
+          addRule({
+            priority: basePriority + 6,
+            action: {
+              type: 'modifyHeaders',
+              requestHeaders: [
+                {
+                  header: 'referer',
+                  operation: 'set',
+                  value: ctx.refererMode.setValue,
+                },
+              ],
+            },
+            condition: this.cleanDNRCondition(refererCondition),
+          });
+        }
+
+        if (ctx.blockEtag) {
+          addRule({
+            priority: basePriority + 7,
+            action: {
+              type: 'modifyHeaders',
+              responseHeaders: [
+                {
+                  header: 'etag',
+                  operation: 'remove',
+                },
+              ],
+            },
+            condition: this.cleanDNRCondition({
+              ...tabConditionBase,
+              resourceTypes: allRequestTypes,
+            }),
+          });
+        }
+
+        if (ctx.websocketMode !== 'allow_all') {
+          addRule({
+            priority: basePriority + 8,
+            action: {
+              type: 'block',
+            },
+            condition: this.cleanDNRCondition({
+              ...tabConditionBase,
+              resourceTypes: ['websocket'],
+              domainType: ctx.websocketMode === 'block_3rd_party' ? 'thirdParty' : undefined,
+            }),
+          });
+
+          addRule({
+            priority: basePriority + 9,
+            action: {
+              type: 'block',
+            },
+            condition: this.cleanDNRCondition({
+              ...tabConditionBase,
+              resourceTypes: pollingRequestTypes,
+              regexFilter: '[?&]transport=polling(?:&|$)',
+              domainType: ctx.websocketMode === 'block_3rd_party' ? 'thirdParty' : undefined,
+            }),
+          });
+        }
+      });
+
+      await updateRules({
+        removeRuleIds: existingRules.map(r => r.id),
+        addRules: rules,
+      });
+    } finally {
+      this.dnrSyncInProgress = false;
+
+      if (this.dnrSyncQueued) {
+        this.dnrSyncQueued = false;
+        this.queueDeclarativeSync(75);
+      }
+    }
+  }
+
+  public async setupHeaderListeners(): Promise<void> {
+    if (browser.declarativeNetRequest) {
+      this.registerDeclarativeListeners();
+      this.queueDeclarativeSync(25);
+      return;
+    }
+
+    if (this.hasLegacyWebRequestListeners || !browser.webRequest) {
+      return;
+    }
+
     /* Block websocket connections */
     browser.webRequest.onBeforeRequest.addListener(
       details => {
@@ -779,6 +1401,8 @@ export class Chameleon {
       },
       ['blocking', 'responseHeaders']
     );
+
+    this.hasLegacyWebRequestListeners = true;
   }
 
   public setTimer(option = null): void {
@@ -795,16 +1419,7 @@ export class Chameleon {
         let interval: number =
           Math.random() * (this.settings.profile.interval.max * 60 * 1000 - this.settings.profile.interval.min * 60 * 1000) + this.settings.profile.interval.min * 60 * 1000;
 
-        /*
-          Use regular timeout for custom interval
-          Allows irregular periods between alarm
-        */
-
-        if (this.intervalTimeout) clearTimeout(this.intervalTimeout);
-        let _this = this;
-        this.intervalTimeout = setTimeout(function() {
-          _this.setTimer();
-        }, interval);
+        alarmInfo['when'] = Date.now() + interval;
       } else {
         alarmInfo['periodInMinutes'] = option;
       }
@@ -1013,11 +1628,23 @@ export class Chameleon {
   }
 
   public toggleContextMenu(enabled: boolean): void {
-    if (enabled && this.platform.os != 'android') {
-      browser.contextMenus.onShown.addListener(this.updateContextMenu);
-    } else if (this.platform.os != 'android' && !enabled) {
+    if (this.platform.os == 'android' || !browser.contextMenus) {
+      return;
+    }
+
+    let hasOnShown =
+      !!browser.contextMenus.onShown && typeof browser.contextMenus.onShown.addListener === 'function' && typeof browser.contextMenus.onShown.removeListener === 'function';
+
+    if (enabled) {
+      if (hasOnShown) {
+        browser.contextMenus.onShown.addListener(this.updateContextMenu);
+      }
+    } else {
       browser.contextMenus.removeAll();
-      browser.contextMenus.onShown.removeListener(this.updateContextMenu);
+
+      if (hasOnShown) {
+        browser.contextMenus.onShown.removeListener(this.updateContextMenu);
+      }
     }
   }
 

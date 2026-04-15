@@ -99,6 +99,40 @@
             </div>
           </div>
         </div>
+        <div class="mt-8 border-t-2 border-primary pt-4 text-lg leading-relaxed">
+          <div class="text-3xl mb-4">Known Issues in this Chromium Port</div>
+          <p class="mb-3">
+            Some settings shown in Firefox builds of Chameleon are not available in Chromium-based browsers. This is due to WebExtension API differences, not a temporary UI bug.
+          </p>
+          <div class="mb-4">
+            <div class="font-semibold">Unavailable option: First-Party Isolation (FPI)</div>
+            <div>
+              Chromium does not expose a browser-level First-Party Isolation setting equivalent to Firefox's
+              <code>privacy.websites.firstPartyIsolate</code>. Because no equivalent API exists, this option cannot be implemented as a true one-click browser preference.
+            </div>
+          </div>
+          <div class="mb-4">
+            <div class="font-semibold">Unavailable option: Resist Fingerprinting</div>
+            <div>
+              Firefox provides a built-in <code>privacy.websites.resistFingerprinting</code> control. Chromium does not provide an equivalent global privacy switch to extensions,
+              so this option is removed in this port.
+            </div>
+          </div>
+          <div class="mb-4">
+            <div class="font-semibold">Unavailable option: Tracking Protection Mode</div>
+            <div>
+              Firefox exposes tracking protection preferences directly to extensions. Chromium does not provide the same mode-based API, so this specific setting is unavailable
+              here.
+            </div>
+          </div>
+          <div class="mb-2">
+            <div class="font-semibold">Unavailable option: Firefox Cookie Policy / Non-persistent Cookie controls</div>
+            <div>
+              Firefox exposes <code>privacy.websites.cookieConfig</code> behavior values (such as tracker-focused modes) that Chromium does not support in the same form. The
+              original cookie controls were removed to avoid presenting settings that cannot be applied reliably.
+            </div>
+          </div>
+        </div>
         <div v-show="isImporting" class="mt-4">
           <div v-t="'options-settings-importing.message'"></div>
           <div class="mt-1 font-bold" :class="[importError.error ? 'text-red-500' : 'text-green-500']" v-text="importError.msg"></div>
@@ -445,6 +479,7 @@ import Vue from 'vue';
 import * as lang from '../lib/language';
 import * as prof from '../lib/profiles';
 import * as tz from '../lib/tz';
+import { getBrowserInfo } from '../lib/compat';
 import util from '../lib/util';
 import webext from '../lib/webext';
 import { Component } from 'vue-property-decorator';
@@ -561,10 +596,11 @@ export default class App extends Vue {
   }
 
   async created(): Promise<void> {
-    this.iconPath = browser.runtime.getURL('icons/icon.svg');
+    this.iconPath = browser.runtime.getURL('icons/icon_128.png');
     this.version = browser.runtime.getManifest().version_name;
     this.platform = (await browser.runtime.getPlatformInfo()).os;
-    this.isLegacyVersion = parseInt(await browser.runtime.getBrowserInfo().version) < 75;
+    let browserInfo = await getBrowserInfo();
+    this.isLegacyVersion = browserInfo.name.toLowerCase().includes('firefox') && parseInt(browserInfo.version, 10) < 75;
 
     await this['$store'].dispatch('initialize');
 

@@ -6,138 +6,184 @@ webext.firstTimeInstall();
 
 store.state.version = browser.runtime.getManifest().version;
 
-let chameleon = new Chameleon(JSON.parse(JSON.stringify(store.state)));
+let chameleonPromise: Promise<Chameleon> | null = null;
+
+let syncPrivacySettings = async (chameleon: Chameleon): Promise<void> => {
+  if (!browser.privacy) {
+    return;
+  }
+
+  if (browser.privacy.websites.cookieConfig) {
+    let cookieSettings = await browser.privacy.websites.cookieConfig.get({});
+    chameleon.settings.options.cookieNotPersistent = cookieSettings.value.nonPersistentCookies;
+    chameleon.settings.options.cookiePolicy = cookieSettings.value.behavior;
+  }
+
+  if (browser.privacy.websites.firstPartyIsolate) {
+    let firstPartyIsolate = await browser.privacy.websites.firstPartyIsolate.get({});
+    chameleon.settings.options.firstPartyIsolate = firstPartyIsolate.value;
+  }
+
+  if (browser.privacy.websites.resistFingerprinting) {
+    let resistFingerprinting = await browser.privacy.websites.resistFingerprinting.get({});
+    chameleon.settings.options.resistFingerprinting = resistFingerprinting.value;
+  }
+
+  if (browser.privacy.websites.trackingProtectionMode) {
+    let trackingProtectionMode = await browser.privacy.websites.trackingProtectionMode.get({});
+    chameleon.settings.options.trackingProtectionMode = trackingProtectionMode.value;
+  }
+
+  if (browser.privacy.network.peerConnectionEnabled) {
+    let peerConnectionEnabled = await browser.privacy.network.peerConnectionEnabled.get({});
+    chameleon.settings.options.disableWebRTC = !peerConnectionEnabled.value;
+  }
+
+  if (browser.privacy.network.webRTCIPHandlingPolicy) {
+    let webRTCIPHandlingPolicy = await browser.privacy.network.webRTCIPHandlingPolicy.get({});
+    chameleon.settings.options.webRTCPolicy = webRTCIPHandlingPolicy.value;
+  }
+};
+
+let getChameleon = async (reload = false): Promise<Chameleon> => {
+  if (!reload && chameleonPromise) {
+    return chameleonPromise;
+  }
+
+  chameleonPromise = (async () => {
+    let chameleon = new Chameleon(JSON.parse(JSON.stringify(store.state)));
+    await chameleon.init(await webext.getSettings(null));
+
+    let injectionData = await webext.getInjectionData();
+    if (injectionData?.tempStore) {
+      chameleon.tempStore = Object.assign({}, chameleon.tempStore, injectionData.tempStore);
+    }
+
+    chameleon.updateProfileCache();
+    return chameleon;
+  })();
+
+  return chameleonPromise;
+};
+
 let messageHandler = (request: any, sender: any, sendResponse: any) => {
-  if (request.action === 'save') {
-    if (chameleon.timeout) {
-      clearTimeout(chameleon.timeout);
-    }
+  (async () => {
+    let chameleon = await getChameleon();
 
-    chameleon.settings = Object.assign(chameleon.settings, request.data);
-    chameleon.timeout = setTimeout(() => {
-      chameleon.saveSettings(request.data);
+    if (request.action === 'save') {
+      chameleon.settings = Object.assign(chameleon.settings, request.data);
+      await chameleon.saveSettings(chameleon.settings);
+      await chameleon.buildInjectionScript();
       sendResponse('done');
-    }, 200);
-  } else if (request.action === 'implicitSave') {
-    if (chameleon.timeout) {
-      clearTimeout(chameleon.timeout);
-    }
-
-    chameleon.timeout = setTimeout(() => {
-      chameleon.saveSettings(chameleon.settings);
+    } else if (request.action === 'tempStore') {
       sendResponse('done');
-    }, 200);
-  } else if (request.action === 'contextMenu') {
-    chameleon.toggleContextMenu(request.data);
-  } else if (request.action === 'toggleBadgeText') {
-    chameleon.updateBadgeText(request.data);
-  } else if (request.action === 'getSettings') {
-    (async () => {
-      if (!!browser.privacy) {
-        let cookieSettings = await browser.privacy.websites.cookieConfig.get({});
-        chameleon.settings.options.cookieNotPersistent = cookieSettings.value.nonPersistentCookies;
-        chameleon.settings.options.cookiePolicy = cookieSettings.value.behavior;
-
-        let firstPartyIsolate = await browser.privacy.websites.firstPartyIsolate.get({});
-        chameleon.settings.options.firstPartyIsolate = firstPartyIsolate.value;
-
-        let resistFingerprinting = await browser.privacy.websites.resistFingerprinting.get({});
-        chameleon.settings.options.resistFingerprinting = resistFingerprinting.value;
-
-        let trackingProtectionMode = await browser.privacy.websites.trackingProtectionMode.get({});
-        chameleon.settings.options.trackingProtectionMode = trackingProtectionMode.value;
-
-        let peerConnectionEnabled = await browser.privacy.network.peerConnectionEnabled.get({});
-        chameleon.settings.options.disableWebRTC = !peerConnectionEnabled.value;
-
-        let webRTCIPHandlingPolicy = await browser.privacy.network.webRTCIPHandlingPolicy.get({});
-        chameleon.settings.options.webRTCPolicy = webRTCIPHandlingPolicy.value;
-      }
+    } else if (request.action === 'implicitSave') {
+      await chameleon.saveSettings(chameleon.settings);
+      await chameleon.buildInjectionScript();
+      sendResponse('done');
+    } else if (request.action === 'contextMenu') {
+      chameleon.toggleContextMenu(request.data);
+      sendResponse('done');
+    } else if (request.action === 'toggleBadgeText') {
+      chameleon.updateBadgeText(request.data);
+      await chameleon.buildInjectionScript();
+      sendResponse('done');
+    } else if (request.action === 'getSettings') {
+      await syncPrivacySettings(chameleon);
 
       let settings = Object.assign({}, chameleon.settings);
       settings.config.hasPrivacyPermission = !!browser.privacy;
 
       sendResponse(settings);
-    })();
-  } else if (request.action === 'init') {
-    browser.runtime.sendMessage(
-      {
-        action: 'tempStore',
-        data: chameleon.tempStore,
-      },
-      response => {
-        if (browser.runtime.lastError) return;
+    } else if (request.action === 'init') {
+      browser.runtime.sendMessage(
+        {
+          action: 'tempStore',
+          data: chameleon.tempStore,
+        },
+        () => {
+          if (browser.runtime.lastError) return;
+        }
+      );
+      sendResponse('done');
+    } else if (request.action === 'reloadInjectionScript') {
+      await chameleon.buildInjectionScript();
+      sendResponse('done');
+    } else if (request.action === 'reloadIPInfo') {
+      if (chameleon.settings.options.timeZone === 'ip' || (chameleon.settings.headers.spoofAcceptLang.value === 'ip' && chameleon.settings.headers.spoofAcceptLang.enabled)) {
+        await chameleon.updateIPInfo();
       }
-    );
-    sendResponse('done');
-  } else if (request.action === 'reloadInjectionScript') {
-    chameleon.buildInjectionScript();
-    sendResponse('done');
-  } else if (request.action === 'reloadIPInfo') {
-    if (chameleon.settings.options.timeZone === 'ip' || (chameleon.settings.headers.spoofAcceptLang.value === 'ip' && chameleon.settings.headers.spoofAcceptLang.enabled)) {
-      chameleon.updateIPInfo();
       sendResponse('done');
+    } else if (request.action === 'reloadProfile') {
+      chameleon.setTimer(request.data);
+      await chameleon.buildInjectionScript();
+      sendResponse('done');
+    } else if (request.action === 'reloadSpoofIP') {
+      if (request.data[0].name === 'headers.spoofIP.enabled') {
+        chameleon.settings.headers.spoofIP.enabled = request.data[0].value;
+      } else if (request.data[0].name === 'headers.spoofIP.option') {
+        chameleon.settings.headers.spoofIP.option = request.data[0].value;
+      } else if (request.data[0].name === 'headers.spoofIP.rangeFrom') {
+        chameleon.settings.headers.spoofIP.rangeFrom = request.data[0].value;
+        chameleon.settings.headers.spoofIP.rangeTo = request.data[1].value;
+      }
+
+      chameleon.updateSpoofIP();
+      chameleon.updateProfileCache();
+      await chameleon.buildInjectionScript();
+      sendResponse('done');
+    } else if (request.action === 'reset') {
+      chameleon.reset();
+      await chameleon.buildInjectionScript();
+      sendResponse('done');
+      browser.runtime.reload();
+    } else if (request.action === 'updateIPRules') {
+      chameleon.settings.ipRules = request.data;
+      await chameleon.saveSettings(chameleon.settings);
+      await chameleon.buildInjectionScript();
+      sendResponse('done');
+    } else if (request.action === 'updateProfile') {
+      chameleon.settings.profile.selected = request.data;
+      chameleon.setTimer();
+      chameleon.start();
+      await chameleon.saveSettings(chameleon.settings);
+      sendResponse('done');
+    } else if (request.action === 'updateWhitelist') {
+      chameleon.settings.whitelist = request.data;
+      chameleon.updateProfileCache();
+      await chameleon.saveSettings(chameleon.settings);
+      await chameleon.buildInjectionScript();
+      sendResponse('done');
+    } else if (request.action === 'validateSettings') {
+      sendResponse(chameleon.validateSettings(request.data));
     }
-  } else if (request.action === 'reloadProfile') {
-    chameleon.setTimer(request.data);
-    chameleon.buildInjectionScript();
-    sendResponse('done');
-  } else if (request.action === 'reloadSpoofIP') {
-    if (request.data[0].name === 'headers.spoofIP.enabled') {
-      chameleon.settings.headers.spoofIP.enabled = request.data[0].value;
-    } else if (request.data[0].name === 'headers.spoofIP.option') {
-      chameleon.settings.headers.spoofIP.option = request.data[0].value;
-    } else if (request.data[0].name === 'headers.spoofIP.rangeFrom') {
-      chameleon.settings.headers.spoofIP.rangeFrom = request.data[0].value;
-      chameleon.settings.headers.spoofIP.rangeTo = request.data[1].value;
-    }
-
-    chameleon.updateSpoofIP();
-    sendResponse('done');
-  } else if (request.action === 'reset') {
-    chameleon.reset();
-    browser.runtime.reload();
-  } else if (request.action === 'updateIPRules') {
-    chameleon.settings.ipRules = request.data;
-
-    chameleon.timeout = setTimeout(() => {
-      chameleon.saveSettings(chameleon.settings);
-      sendResponse('done');
-    }, 200);
-  } else if (request.action === 'updateProfile') {
-    chameleon.settings.profile.selected = request.data;
-
-    // reset interval timer and send notification
-    chameleon.setTimer();
-    sendResponse('done');
-  } else if (request.action === 'updateWhitelist') {
-    chameleon.settings.whitelist = request.data;
-    chameleon.updateProfileCache();
-
-    chameleon.timeout = setTimeout(() => {
-      chameleon.saveSettings(chameleon.settings);
-      sendResponse('done');
-    }, 200);
-  } else if (request.action === 'validateSettings') {
-    let res = chameleon.validateSettings(request.data);
-    sendResponse(res);
-  }
+  })();
 
   return true;
 };
 
-browser.alarms.onAlarm.addListener(() => {
+browser.alarms.onAlarm.addListener(async () => {
+  let chameleon = await getChameleon();
   chameleon.run();
+
+  if (chameleon.settings.profile.interval.option === -1) {
+    chameleon.setTimer();
+  }
 });
 
 browser.runtime.onMessage.addListener(messageHandler);
 
 (async () => {
-  await chameleon.init(await webext.getSettings(null));
+  let chameleon = await getChameleon(true);
+  let injectionData = await webext.getInjectionData();
+
+  if (!injectionData) {
+    chameleon.start();
+  }
 
   if (chameleon.settings.options.timeZone === 'ip' || (chameleon.settings.headers.spoofAcceptLang.value === 'ip' && chameleon.settings.headers.spoofAcceptLang.enabled)) {
     setTimeout(() => {
-      chameleon.updateIPInfo();
+      getChameleon().then(instance => instance.updateIPInfo());
     }, chameleon.settings.config.reloadIPStartupDelay * 1000);
   }
 
@@ -146,7 +192,11 @@ browser.runtime.onMessage.addListener(messageHandler);
   }
 
   chameleon.setupHeaderListeners();
-  chameleon.setTimer();
+
+  let alarms = await browser.alarms.getAll();
+  if (alarms.length === 0 && chameleon.settings.profile.interval.option !== 0) {
+    chameleon.setTimer();
+  }
 
   webext.enableChameleon(chameleon.settings.config.enabled);
   chameleon.toggleContextMenu(chameleon.settings.whitelist.enabledContextMenu);

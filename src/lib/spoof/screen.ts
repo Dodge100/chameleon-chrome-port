@@ -1,6 +1,6 @@
-export default {
-  type: 'custom',
-  data: `
+import { CustomInjectionFn } from './types';
+
+const screen: CustomInjectionFn = (spoofContext, CHAMELEON_SPOOF) => {
   let screenData = CHAMELEON_SPOOF.get(spoofContext).screen;
 
   if (screenData.width != null) {
@@ -8,53 +8,57 @@ export default {
       screenData.availHeight = screenData.height - (spoofContext.screen.height - spoofContext.screen.availHeight);
     }
 
-    ['top', 'left', 'availTop', 'availLeft'].forEach((k) => {
+    ['top', 'left', 'availTop', 'availLeft'].forEach(k => {
       Object.defineProperty(spoofContext.Screen.prototype, k, {
-        get: (() => 0).bind(null)
+        get: (() => 0).bind(null),
       });
     });
 
-    ['colorDepth', 'pixelDepth'].forEach((k) => {
+    ['colorDepth', 'pixelDepth'].forEach(k => {
       Object.defineProperty(spoofContext.Screen.prototype, k, {
-        get: (() => screenData.pixelDepth ).bind(null)
+        get: (() => screenData.pixelDepth).bind(null),
       });
     });
 
-    ['availWidth', 'width'].forEach((k) => {
+    ['availWidth', 'width'].forEach(k => {
       Object.defineProperty(spoofContext.Screen.prototype, k, {
-        get: (() => screenData.width).bind(null)
+        get: (() => screenData.width).bind(null),
       });
     });
 
-    ['innerWidth', 'outerWidth'].forEach((k) => {
+    ['innerWidth', 'outerWidth'].forEach(k => {
       Object.defineProperty(spoofContext, k, {
-        get: (() => screenData.width).bind(null)
+        get: (() => screenData.width).bind(null),
       });
     });
 
-    ['innerHeight'].forEach((k) => {
+    ['innerHeight'].forEach(k => {
       Object.defineProperty(spoofContext, k, {
-        get: (() => screenData.availHeight).bind(null)
+        get: (() => screenData.availHeight).bind(null),
       });
     });
 
-    ['outerHeight'].forEach((k) => {
+    ['outerHeight'].forEach(k => {
       Object.defineProperty(spoofContext, k, {
-        get: (() => screenData.height).bind(null)
+        get: (() => screenData.height).bind(null),
       });
     });
 
     Object.defineProperty(spoofContext.Screen.prototype, 'availHeight', {
-      get: (() => screenData.availHeight).bind(null)
+      get: (() => screenData.availHeight).bind(null),
     });
 
     Object.defineProperty(spoofContext.Screen.prototype, 'height', {
-      get: (() => screenData.height).bind(null)
+      get: (() => screenData.height).bind(null),
     });
 
     Object.defineProperty(spoofContext, 'devicePixelRatio', {
-      get: (() => screenData.deviceScaleFactor || 1).bind(null)
+      get: (() => screenData.deviceScaleFactor || 1).bind(null),
     });
   }
-  `,
+};
+
+export default {
+  type: 'custom',
+  data: screen,
 };
